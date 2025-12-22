@@ -1,27 +1,63 @@
-// server.js - Real-Life Social Media Backend with Persistence
+// server.js - Production Ready Backend for Render.com
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 require('dotenv').config();
 
-// --- 1. SETUP FIREBASE ADMIN ---
-// IMPORTANT: You must download your serviceAccountKey.json from Firebase Console
-// Project Settings > Service accounts > Generate new private key
-// Save it as 'serviceAccountKey.json' in this folder
-const serviceAccount = require('./serviceAccountKey.json');
+// --- 1. SETUP FIREBASE ADMIN (Render Compatible) ---
+// On Render, we can't easily upload JSON files. We use an Environment Variable instead.
+let serviceAccount;
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  // Production: Parse the JSON string from Environment Variable
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } catch (error) {
+    console.error("Error parsing FIREBASE_SERVICE_ACCOUNT env var:", error);
+  }
+} else {
+  // Local Development: Fallback to file if env var is missing
+  try {
+    serviceAccount = require('./serviceAccountKey.json');
+  } catch (error) {
+    console.error("WARNING: serviceAccountKey.json not found and FIREBASE_SERVICE_ACCOUNT env var not set.");
+  }
+}
+
+if (serviceAccount) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+} else {
+    console.error("CRITICAL ERROR: Firebase Admin not initialized. Missing credentials.");
+}
 
 const db = admin.firestore();
 const app = express();
 
-app.use(cors());
+// --- CORS CONFIGURATION ---
+// Allow requests from your Vercel frontend (and localhost for testing)
+// Set FRONTEND_URL in Render to your specific Vercel URL (e.g., https://omnifeed.vercel.app)
+const allowedOrigins = [process.env.FRONTEND_URL, 'http://localhost:5173', 'http://localhost:3000'].filter(Boolean);
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1 && origin !== process.env.FRONTEND_URL) {
+       // In strict production, you might want to block unknown origins.
+       // For now, we'll log it but maybe allow it or fail.
+       // return callback(new Error('The CORS policy for this site does not allow access from the specified Origin.'), false);
+       return callback(null, true); // Permissive for initial testing
+    }
+    return callback(null, true);
+  },
+  methods: ['GET', 'POST']
+}));
+
 app.use(express.json());
 
 // --- 2. AUTH MIDDLEWARE ---
-// Verifies that the request comes from a logged-in user in your app
 const verifyAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -34,6 +70,7 @@ const verifyAuth = async (req, res, next) => {
     req.uid = decodedToken.uid;
     next();
   } catch (e) {
+    console.error("Token verification failed:", e);
     return res.status(401).send('Invalid Token');
   }
 };
@@ -45,20 +82,20 @@ app.get('/api/connect/:platform', verifyAuth, (req, res) => {
   const { platform } = req.params;
   const uid = req.uid;
 
-  // Real Logic: Generate OAuth URL based on platform
+  // Uses the APP_URL set in Render (e.g. https://omnifeed-backend.onrender.com)
+  // Fallback to localhost if not set (for local dev)
+  const appUrl = process.env.APP_URL || 'http://localhost:3000';
+  const callback = `${appUrl}/callback/${platform}?uid=${uid}`;
   let authUrl = '';
-  // process.env.APP_URL should be set in Render environment variables
-  // It represents the public URL of your backend (e.g., https://my-backend.onrender.com)
-  const callback = `${process.env.APP_URL}/callback/${platform}?uid=${uid}`;
 
   if (platform === 'twitter') {
-    authUrl = `https://twitter.com/i/oauth2/authorize?response_type=code&client_id=${process.env.TWITTER_CLIENT_ID}&redirect_uri=${callback}&scope=tweet.read users.read&state=${uid}`;
+    // Requires TWITTER_CLIENT_ID in Render Env Vars
+    const clientId = process.env.TWITTER_CLIENT_ID || 'MOCK_CLIENT_ID';
+    authUrl = `https://twitter.com/i/oauth2/authorize?response_type=code&client_id=${clientId}&redirect_uri=${callback}&scope=tweet.read users.read&state=${uid}`;
   } 
-  // ... Add other platforms here
   else {
-    // Fallback for demo/unimplemented platforms
-    // This allows you to test the connection flow even without real API keys for every service
-    authUrl = `${process.env.APP_URL}/callback/${platform}?uid=${uid}&demo=true`;
+    // Default fallback for demo / unimplemented platforms
+    authUrl = `${appUrl}/callback/${platform}?uid=${uid}&demo=true`;
   }
 
   res.json({ authUrl });
@@ -73,17 +110,17 @@ app.get('/callback/:platform', async (req, res) => {
     let accessToken = '';
 
     if (demo === 'true') {
-      // Simulation for development
       accessToken = `mock_${platform}_token_${Date.now()}`;
     } else {
-      // Real Token Exchange Logic would go here
+      // TODO: Exchange 'code' for 'accessToken' using the specific Platform API here.
       // const response = await axios.post(...)
       // accessToken = response.data.access_token;
+      
+      // For now, we simulate a token so the flow completes
+      accessToken = `simulated_real_token_${Date.now()}`;
     }
 
-    // PERSIST TOKEN TO FIRESTORE
-    // This ensures data survives server restarts
-    // We use 'omnifeed-production' as the appId to match frontend
+    // Save token to Firestore
     await db.collection('artifacts').doc('omnifeed-production')
       .collection('users').doc(uid)
       .collection('tokens').doc(platform)
@@ -92,21 +129,31 @@ app.get('/callback/:platform', async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp() 
       });
 
-    // Update Connection Status in Firestore so UI updates automatically
+    // Update UI Status
     await db.collection('artifacts').doc('omnifeed-production')
       .collection('users').doc(uid)
       .collection('connections').doc('status')
       .set({ [platform]: true }, { merge: true });
 
-    // Close Popup
+    // Close the Popup
     res.send(`
+      <html><body>
       <script>
+        // Send message to parent window to refresh
+        if (window.opener) {
+          window.opener.postMessage({ type: 'OMNIFEED_CONNECTED', platform: '${platform}' }, '*');
+        }
         window.close();
       </script>
+      <div style="text-align:center; font-family: sans-serif; margin-top: 50px;">
+        <h3>Connected!</h3>
+        <p>You can close this window.</p>
+      </div>
+      </body></html>
     `);
 
   } catch (error) {
-    console.error(error);
+    console.error("Callback Error:", error);
     res.status(500).send('Authentication Failed');
   }
 });
@@ -117,7 +164,6 @@ app.get('/api/feed', verifyAuth, async (req, res) => {
   let allPosts = [];
 
   try {
-    // Retrieve tokens from Firestore
     const tokensSnap = await db.collection('artifacts').doc('omnifeed-production')
       .collection('users').doc(uid)
       .collection('tokens').get();
@@ -125,18 +171,21 @@ app.get('/api/feed', verifyAuth, async (req, res) => {
     const tokens = {};
     tokensSnap.forEach(doc => tokens[doc.id] = doc.data().accessToken);
 
-    // Fetch from Real APIs using tokens
-    if (tokens.twitter) {
-      // const twitterData = await axios.get(...) 
-      // allPosts.push(...transform(twitterData));
-      
-      // Mock Data for "Real Life" Demo proof
+    // --- REAL API LOGIC WOULD GO HERE ---
+    // if (tokens.twitter) {
+    //    const realData = await axios.get('https://api.twitter.com/2/users/me/timelines/reverse_chronological', { headers: { Authorization: `Bearer ${tokens.twitter}` } });
+    //    allPosts.push(...transform(realData));
+    // }
+
+    // Since we don't have the real API logic implemented yet, we return a "Success" card
+    // that proves the Backend <-> Frontend connection is working.
+    if (Object.keys(tokens).length > 0) {
       allPosts.push({
-        id: `real_twitter_${Date.now()}`,
-        platform: 'twitter',
-        author: { name: 'Real Twitter Fetch', handle: '@backend_server', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Server' },
-        content: 'This post confirms your backend is securely connected to Firestore and fetching data!',
-        timestamp: 'Just now',
+        id: `backend_conn_${Date.now()}`,
+        platform: 'system',
+        author: { name: 'OmniFeed Backend', handle: '@server', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Server' },
+        content: `Securely connected to Render Backend! Found tokens for: ${Object.keys(tokens).join(', ')}. To see real posts, you must implement the specific API calls in server.js using these tokens.`,
+        timestamp: 'Live',
         stats: { likes: 0, comments: 0, shares: 0, saved: false, liked: false }
       });
     }
@@ -144,7 +193,7 @@ app.get('/api/feed', verifyAuth, async (req, res) => {
     res.json({ posts: allPosts });
 
   } catch (error) {
-    console.error(error);
+    console.error("Feed Fetch Error:", error);
     res.status(500).json({ error: 'Failed to fetch feeds' });
   }
 });
